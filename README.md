@@ -35,9 +35,9 @@ per cycle. The label is RUL = cycles remaining until failure.
 ```bash
 pip install -r requirements.txt
 cd src
-python make_synthetic_data.py   # or drop real FD001 files into ../data
-python train.py                 # -> models/rul_xgb.json + meta.json
-python evaluate.py              # test-set RMSE + NASA score
+python make_synthetic_data.py   
+python train.py                 
+python evaluate.py              
 ```
 
 ## Edge inference service (bonus)
@@ -62,6 +62,12 @@ docker run -p 8000:8000 rul-edge
 ```
 pdm/
 ├── data/                     C-MAPSS files (synthetic or real)
+├── copilot/
+│   ├── manuals 
+│   ├── agent.py          
+│   ├── api.py
+│   ├── graph_kg.py           
+│   └── rag.py           
 ├── src/
 │   ├── make_synthetic_data.py
 │   ├── data_prep.py          load, RUL labels, feature engineering
@@ -121,13 +127,9 @@ Engine→Sensor→FailureMode knowledge graph.
 ```bash
 pip install -r copilot/requirements.txt
 
-# Build the RAG index over copilot/manuals/ (drop your own PDFs here first)
 python -m copilot.rag
+export GEMINI_API_KEY=sk-ant-...       
 
-# Set an LLM key for full agentic reasoning (either provider works)
-export ANTHROPIC_API_KEY=sk-ant-...       # or: export OPENAI_API_KEY=sk-...
-
-# Run the API
 uvicorn copilot.api:app --host 0.0.0.0 --port 8100
 ```
 
@@ -137,31 +139,25 @@ the manuals via RAG, so the system is fully runnable for a demo before you add a
 ## Endpoints
 
 ```bash
-# Ask the copilot
 curl -X POST http://localhost:8100/ask \
   -H "Content-Type: application/json" \
   -d '{"question": "Engine 3 shows rising HPC temperature and fuel flow — what failure mode is this and what should I do?"}'
 
-# Direct RUL tool
 curl -X POST http://localhost:8100/predict_rul \
   -H "Content-Type: application/json" \
   -d '{"unit_id": 3, "cycles": [{"sensor_1": 520, "sensor_2": 640}]}'
 
-# Rebuild index after adding manuals
 curl -X POST http://localhost:8100/reindex
 
-# Subsystem status
 curl http://localhost:8100/health
 ```
 
 ## Optional: Neo4j knowledge graph
 
 ```bash
-# Bring up copilot + Neo4j together
 export ANTHROPIC_API_KEY=sk-ant-...
 docker compose -f copilot/docker-compose.yml up --build
 
-# Seed the Engine→Sensor→FailureMode graph
 python -m copilot.graph_kg
 ```
 
@@ -173,9 +169,3 @@ a built-in sensor→mode map, so nothing breaks.
 Drop `.pdf`, `.md`, or `.txt` files into `copilot/manuals/` and run
 `python -m copilot.rag` (or `POST /reindex`). PDFs are parsed with `pypdf`.
 
-## Notes
-
-- Embeddings are local (no API key, no per-call cost); only the agent's reasoning LLM
-  uses an API key.
-- The bundled manual is synthetic sample content — replace it with real OEM
-  documentation for a production knowledge base.
