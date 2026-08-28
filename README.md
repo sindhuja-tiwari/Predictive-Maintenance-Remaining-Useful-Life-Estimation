@@ -77,3 +77,105 @@ pdm/
 - Add FD002–FD004 (multiple operating conditions / fault modes).
 - Swap in an LSTM/1D-CNN sequence model and compare against the XGBoost baseline.
 - Add a simple dashboard plotting predicted RUL and alert history per unit.
+
+# Maintenance Copilot
+
+An agent that answers questions about turbofan-engine health by combining the
+trained C-MAPSS RUL model with retrieval over maintenance manuals and an optional
+Engine→Sensor→FailureMode knowledge graph.
+
+## Architecture
+
+```
+                    ┌──────────────────────────────┐
+   question  ─────▶ │   LangGraph state graph        │
+                    │                                │
+                    │   START → agent → tools →┐     │
+                    │             ▲────────────┘     │
+                    │             └──────────→ END   │
+                    └──────┬─────────────┬───────────┘
+                           │             │
+              tool node dispatches to:   │
+        ┌──────────────────┼─────────────┼───────────────────┐
+        ▼                  ▼             ▼                    ▼
+   predict_rul       search_manuals   failure_modes    (LLM reasoning)
+   XGBoost RUL       Chroma + local   Neo4j graph
+   model (tool)      embeddings (RAG) (optional)
+```
+
+- **agent node** — calls the LLM (Anthropic or OpenAI) with tool schemas; the model
+  decides whether to answer or call a tool.
+- **tools node** — executes requested tools and feeds results back.
+- The conditional edge loops agent↔tools until the model produces a final answer.
+
+## Tools
+
+| Tool | Backed by | Use |
+|---|---|---|
+| `predict_rul` | trained XGBoost model (`../models/`) | estimate RUL + alert from sensor window |
+| `search_manuals` | Chroma vector store + `all-MiniLM-L6-v2` embeddings | retrieve guidance from manuals |
+| `failure_modes` | Neo4j (optional; static-map fallback) | map a sensor to failure modes + mitigations |
+
+## Setup
+
+```bash
+pip install -r copilot/requirements.txt
+
+# Build the RAG index over copilot/manuals/ (drop your own PDFs here first)
+python -m copilot.rag
+
+# Set an LLM key for full agentic reasoning (either provider works)
+export ANTHROPIC_API_KEY=sk-ant-...       # or: export OPENAI_API_KEY=sk-...
+
+# Run the API
+uvicorn copilot.api:app --host 0.0.0.0 --port 8100
+```
+
+Without an API key, the agent runs in **retrieval-only mode**: it still answers from
+the manuals via RAG, so the system is fully runnable for a demo before you add a key.
+
+## Endpoints
+
+```bash
+# Ask the copilot
+curl -X POST http://localhost:8100/ask \
+  -H "Content-Type: application/json" \
+  -d '{"question": "Engine 3 shows rising HPC temperature and fuel flow — what failure mode is this and what should I do?"}'
+
+# Direct RUL tool
+curl -X POST http://localhost:8100/predict_rul \
+  -H "Content-Type: application/json" \
+  -d '{"unit_id": 3, "cycles": [{"sensor_1": 520, "sensor_2": 640}]}'
+
+# Rebuild index after adding manuals
+curl -X POST http://localhost:8100/reindex
+
+# Subsystem status
+curl http://localhost:8100/health
+```
+
+## Optional: Neo4j knowledge graph
+
+```bash
+# Bring up copilot + Neo4j together
+export ANTHROPIC_API_KEY=sk-ant-...
+docker compose -f copilot/docker-compose.yml up --build
+
+# Seed the Engine→Sensor→FailureMode graph
+python -m copilot.graph_kg
+```
+
+If `NEO4J_URI` is unset or the database is unreachable, `failure_modes` falls back to
+a built-in sensor→mode map, so nothing breaks.
+
+## Adding your own manuals
+
+Drop `.pdf`, `.md`, or `.txt` files into `copilot/manuals/` and run
+`python -m copilot.rag` (or `POST /reindex`). PDFs are parsed with `pypdf`.
+
+## Notes
+
+- Embeddings are local (no API key, no per-call cost); only the agent's reasoning LLM
+  uses an API key.
+- The bundled manual is synthetic sample content — replace it with real OEM
+  documentation for a production knowledge base.
