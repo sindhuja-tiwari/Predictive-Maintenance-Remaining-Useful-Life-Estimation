@@ -40,6 +40,7 @@ def _startup():
 @app.get("/health")
 def health():
     provider = ("anthropic" if os.environ.get("ANTHROPIC_API_KEY")
+                else "gemini" if os.environ.get("GEMINI_API_KEY")
                 else "openai" if os.environ.get("OPENAI_API_KEY") else None)
     return {
         "status": "up",

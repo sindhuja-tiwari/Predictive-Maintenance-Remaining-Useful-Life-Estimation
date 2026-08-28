@@ -95,6 +95,8 @@ SYSTEM_PROMPT = (
 def _provider():
     if os.environ.get("ANTHROPIC_API_KEY"):
         return "anthropic"
+    if os.environ.get("GEMINI_API_KEY"):
+        return "gemini"
     if os.environ.get("OPENAI_API_KEY"):
         return "openai"
     return None
@@ -160,15 +162,31 @@ def build_agent():
             else:
                 state["answer"] = text
                 state["_pending"] = []
-        else:  # openai
+        else:  # openai OR gemini (both via the OpenAI-compatible client)
             from openai import OpenAI
-            client = OpenAI()
-            model = os.environ.get("COPILOT_MODEL", "gpt-4o-mini")
+            if provider == "gemini":
+                client = OpenAI(
+                    api_key=os.environ["GEMINI_API_KEY"],
+                    base_url="https://generativelanguage.googleapis.com/v1beta/openai/")
+                model = os.environ.get("COPILOT_MODEL", "gemini-2.5-flash")
+            else:
+                client = OpenAI()
+                model = os.environ.get("COPILOT_MODEL", "gpt-4o-mini")
             resp = client.chat.completions.create(
                 model=model, tools=_openai_schemas(),
                 messages=[{"role": "system", "content": SYSTEM_PROMPT}] + msgs)
             m = resp.choices[0].message
-            state["messages"] = msgs + [m.model_dump()]
+            # Build a clean assistant message. Gemini's OpenAI-compatible endpoint
+            # rejects/ignores messages with null content or extra fields, which can
+            # yield an empty final answer — so we reconstruct only what's needed.
+            assistant_msg = {"role": "assistant", "content": m.content or ""}
+            if m.tool_calls:
+                assistant_msg["tool_calls"] = [
+                    {"id": tc.id, "type": "function",
+                     "function": {"name": tc.function.name,
+                                  "arguments": tc.function.arguments or "{}"}}
+                    for tc in m.tool_calls]
+            state["messages"] = msgs + [assistant_msg]
             state.setdefault("trace", [])
             if m.tool_calls:
                 state["_pending"] = [
@@ -219,7 +237,17 @@ class _CompiledAgent:
         state = {"messages": [{"role": "user", "content": question}],
                  "answer": "", "trace": []}
         final = self.app.invoke(state)
-        return {"answer": final.get("answer", ""), "trace": final.get("trace", [])}
+        answer = (final.get("answer") or "").strip()
+        # Safety net: if the model returned nothing usable, ground a reply in RAG so
+        # the user always gets a substantive answer instead of an empty string.
+        if not answer:
+            hits = rag.retrieve(question, k=3)
+            if hits:
+                answer = ("Based on the maintenance manuals:\n\n" +
+                          "\n\n".join(f"• {h['text'][:400].strip()}" for h in hits))
+            else:
+                answer = "I couldn't generate an answer. Try rephrasing the question."
+        return {"answer": answer, "trace": final.get("trace", [])}
 
 
 class _RetrievalOnlyAgent:

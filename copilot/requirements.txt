@@ -1,5 +1,25 @@
+# Core RUL model (shared with the main service)
 numpy>=1.26
 pandas>=2.0
 scikit-learn>=1.3
 xgboost>=2.0
-flask>=3.0
+
+# Agent + RAG stack
+langgraph>=0.2
+fastapi>=0.110
+uvicorn>=0.29
+pydantic>=2.0
+
+# Vector store + local embeddings (no API key needed for embeddings)
+chromadb>=0.5
+sentence-transformers>=3.0
+
+# PDF ingestion for manuals
+pypdf>=4.0
+
+# LLM providers (only the one matching your API key is used at runtime)
+anthropic>=0.39
+openai>=1.40
+
+# Optional knowledge graph
+neo4j>=5.0
