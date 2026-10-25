@@ -78,7 +78,6 @@ def build_index(force=False):
     """Index all manuals. Idempotent unless force=True (which clears first)."""
     col = _get_collection()
     if force and col.count() > 0:
-        import chromadb
         _client.delete_collection(COLLECTION)
         globals()["_collection"] = None
         col = _get_collection()
@@ -118,6 +117,10 @@ def retrieve(query, k=4):
     col = _get_collection()
     if col.count() == 0:
         build_index()
+        col = _get_collection()
+    if col.count() == 0:
+        return []
+    k = max(1, min(int(k), 10, col.count()))
     q_emb = _embed([query])
     res = col.query(query_embeddings=q_emb, n_results=k,
                     include=["documents", "metadatas", "distances"])
@@ -134,4 +137,3 @@ if __name__ == "__main__":
     if n:
         for r in retrieve("what should I do when RUL is critical?", k=3):
             print(f"\n[{r['source']} #{r['chunk']} score={r['score']}]\n{r['text'][:180]}...")
-            
