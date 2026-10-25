@@ -1,5 +1,5 @@
-# Lightweight container for edge inference.
-# Small base image + a ~200KB model = deployable on a gateway box near the line.
+# Lightweight container for edge inference: small base image + a ~1.5 MB model,
+# deployable on a gateway box near the line.
 FROM python:3.12-slim
 
 # OpenMP runtime required by XGBoost (libgomp).
@@ -10,14 +10,13 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+# Ship the committed model trained on real FD001 (retrain with src/train.py).
+# data/ is needed only for the dashboard's demo engines.
 COPY src/ ./src/
 COPY service/ ./service/
-# models/ is regenerated at build time below (see train step); no COPY needed
-
-# Ensure a trained model exists in the image. If models/ was committed, this
-# regenerates deterministically; if not, it trains from synthetic data at build.
-RUN cd src && python make_synthetic_data.py && python train.py && cd ..
+COPY models/ ./models/
+COPY data/ ./data/
 
 EXPOSE 8000
-# Render provides $PORT at runtime; app.py reads it (falls back to 8000 locally).
-CMD ["python", "service/app.py"]
+# Render provides $PORT at runtime; falls back to 8000 locally.
+CMD ["sh", "-c", "exec gunicorn --chdir service --bind 0.0.0.0:${PORT:-8000} --workers 2 --timeout 60 app:app"]
