@@ -9,14 +9,26 @@ Endpoints:
 
 Run:  uvicorn copilot.api:app --host 0.0.0.0 --port 8100
 """
-import os
-from fastapi import FastAPI
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
 from . import agent as agent_mod
 from . import rag, rul_tool, graph_kg
 
-app = FastAPI(title="Turbofan Maintenance Copilot")
+
+@asynccontextmanager
+async def lifespan(_app):
+    # Build the RAG index up front (otherwise it is built on the first query).
+    try:
+        rag.build_index()
+    except Exception as e:
+        print(f"[api] index build deferred: {e}")
+    yield
+
+
+app = FastAPI(title="Turbofan Maintenance Copilot", lifespan=lifespan)
 
 
 class AskBody(BaseModel):
@@ -24,24 +36,13 @@ class AskBody(BaseModel):
 
 
 class RulBody(BaseModel):
-    cycles: list
+    cycles: list[dict]
     unit_id: int = 1
-
-
-@app.on_event("startup")
-def _startup():
-    # Ensure the RAG index exists (builds on first call otherwise).
-    try:
-        rag.build_index()
-    except Exception as e:
-        print(f"[api] index build deferred: {e}")
 
 
 @app.get("/health")
 def health():
-    provider = ("anthropic" if os.environ.get("ANTHROPIC_API_KEY")
-                else "gemini" if os.environ.get("GEMINI_API_KEY")
-                else "openai" if os.environ.get("OPENAI_API_KEY") else None)
+    provider = agent_mod.provider()
     return {
         "status": "up",
         "llm_provider": provider or "none (retrieval-only)",
@@ -57,7 +58,10 @@ def ask(body: AskBody):
 
 @app.post("/predict_rul")
 def predict_rul(body: RulBody):
-    return rul_tool.predict_rul(body.cycles, unit_id=body.unit_id)
+    out = rul_tool.predict_rul(body.cycles, unit_id=body.unit_id)
+    if "error" in out:
+        raise HTTPException(status_code=400, detail=out["error"])
+    return out
 
 
 @app.post("/reindex")

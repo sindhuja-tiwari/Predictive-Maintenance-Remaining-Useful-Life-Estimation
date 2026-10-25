@@ -2,10 +2,11 @@
 
 ## RUL Interpretation
 Remaining Useful Life (RUL) is the estimated number of operating cycles before an
-engine reaches a failure threshold. The model reports RUL with a health index (0-100%).
-- Health index above 40%: normal operation, continue routine monitoring.
-- Health index 15-40% (WARNING): schedule maintenance in the next planned window.
-- Health index below 15% (CRITICAL): remove from service and inspect before next cycle.
+engine reaches a failure threshold. The model reports RUL with a health index (0-100%),
+where 100% means 125 or more cycles remain.
+- RUL above 50 cycles (health index above 40%, OK): normal operation, continue routine monitoring.
+- RUL 21-50 cycles (health index 17-40%, WARNING): schedule maintenance in the next planned window.
+- RUL 20 cycles or less (health index 16% or less, CRITICAL): remove from service and inspect before next cycle.
 
 ## Common Failure Modes
 HPC Degradation: rising HPC outlet temperature and fuel flow, falling HPC outlet
