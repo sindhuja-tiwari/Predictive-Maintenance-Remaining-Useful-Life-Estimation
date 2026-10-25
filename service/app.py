@@ -1,89 +1,112 @@
 """
-Lightweight RUL inference service — simulates edge deployment.
+Lightweight RUL inference service that simulates edge deployment.
 
-A single-file Flask app that loads the ~200KB XGBoost model into memory once and
+A single-file Flask app that loads the XGBoost model into memory once and
 serves predictions over HTTP. Small enough to run on a gateway/edge box next to
 the machinery instead of round-tripping raw sensor streams to the cloud.
 
 Endpoints:
-  GET  /              industrial command-center dashboard (live RUL monitor)
-  GET  /health        liveness + model metadata
+  GET  /              command-center dashboard (replays held-out engines)
+  GET  /health        liveness + model metadata and test metrics
   POST /predict       score one engine's recent cycle window -> RUL + alert
+  GET  /demo/sample   a window from a held-out FD001 engine, for the dashboard
 
-POST body:
+POST /predict body:
 {
   "unit_id": 7,
-  "cycles": [                     # most recent cycles, oldest -> newest
-    {"op_setting_1":..., ..., "sensor_1":..., ..., "sensor_21":...},
+  "cycles": [                     # at least 15 most recent cycles, oldest -> newest
+    {"sensor_2": 642.1, "sensor_3": 1589.7, ..., "sensor_21": 23.4},
     ...
   ]
 }
+Every sensor listed in /health -> required_sensors must be present in every
+cycle; missing or non-numeric readings are rejected with HTTP 400.
 """
 import os
-import json
-import numpy as np
-import pandas as pd
-import xgboost as xgb
+import sys
+
 from flask import Flask, request, jsonify, render_template_string
 
-import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
-import data_prep as dp
-
-MODEL_DIR = os.path.join(os.path.dirname(__file__), "..", "models")
-WARN_RUL, CRITICAL_RUL = 50, 20  # maintenance thresholds (cycles)
-RUL_CLIP_DEFAULT = 125
+import data_prep as dp  # noqa: E402
+from inference import InputError, get_predictor  # noqa: E402
 
 app = Flask(__name__)
+PREDICTOR = get_predictor()
+META = PREDICTOR.meta
 
-with open(os.path.join(MODEL_DIR, "meta.json")) as f:
-    META = json.load(f)
-MODEL = xgb.XGBRegressor()
-MODEL.load_model(os.path.join(MODEL_DIR, "rul_xgb.json"))
+DEMO_UNITS = META.get("val_units", [])[:6]
+DEMO_WINDOW = 30
+SPARK_SENSORS = [("sensor_3", "HPC outlet temp", "\u00b0R"),
+                 ("sensor_4", "LPT outlet temp", "\u00b0R"),
+                 ("sensor_11", "HPC static pressure", "psia"),
+                 ("sensor_12", "Fuel flow / Ps30", "pps/psi")]
+_DEMO_DATA = None
 
 
-def _alert(rul):
-    if rul <= CRITICAL_RUL:
-        return "CRITICAL", "Schedule maintenance immediately — imminent failure risk."
-    if rul <= WARN_RUL:
-        return "WARNING", "Plan maintenance in upcoming window to avoid unplanned downtime."
-    return "OK", "Equipment healthy. Continue normal operation."
+def _demo_data():
+    global _DEMO_DATA
+    if _DEMO_DATA is None:
+        df = dp.load_raw("train")
+        _DEMO_DATA = df[df["unit"].isin(DEMO_UNITS)]
+    return _DEMO_DATA
 
 
 @app.get("/")
 def dashboard():
-    return render_template_string(DASHBOARD, rul_clip=META.get("rul_clip", RUL_CLIP_DEFAULT))
+    return render_template_string(DASHBOARD, rul_clip=META["rul_clip"],
+                                  demo_units=DEMO_UNITS, spark=SPARK_SENSORS)
 
 
 @app.get("/health")
 def health():
-    return jsonify(status="up", model="rul_xgb",
+    return jsonify(status="up", model="rul_xgb", dataset=META.get("dataset"),
+                   required_sensors=PREDICTOR.required_sensors,
+                   min_cycles=META.get("min_cycles", 1),
+                   n_features=len(META["feature_cols"]),
                    val_rmse=META.get("val_rmse"),
-                   n_features=len(META["feature_cols"]))
+                   test_rmse=META.get("test_rmse"),
+                   test_nasa_score=META.get("test_nasa_score"),
+                   test_engines=META.get("test_engines"))
 
 
 @app.post("/predict")
 def predict():
-    payload = request.get_json(force=True)
-    cycles = payload.get("cycles", [])
-    if not cycles:
-        return jsonify(error="no cycles provided"), 400
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        return jsonify(error="body must be a JSON object with a 'cycles' list"), 400
+    unit_id = payload.get("unit_id", 1)
+    if isinstance(unit_id, bool) or not isinstance(unit_id, (int, str)):
+        return jsonify(error="'unit_id' must be an integer or string"), 400
+    try:
+        return jsonify(PREDICTOR.predict(payload.get("cycles"), unit_id=unit_id))
+    except InputError as e:
+        return jsonify(error=str(e)), 400
 
-    df = pd.DataFrame(cycles)
-    df.insert(0, "cycle", np.arange(1, len(df) + 1))
-    df.insert(0, "unit", payload.get("unit_id", 1))
-    for c in dp.SENSOR_COLS + dp.OP_COLS:
-        if c not in df.columns:
-            df[c] = 0.0
 
-    feats = dp.engineer(df, META["sensors"], tuple(META["windows"]))
-    x_last = feats.iloc[[-1]][META["feature_cols"]]
-    rul = float(np.clip(MODEL.predict(x_last)[0], 0, META["rul_clip"]))
-    level, msg = _alert(rul)
-    return jsonify(unit_id=payload.get("unit_id", 1),
-                   predicted_rul_cycles=round(rul, 1),
-                   health_index=round(100 * rul / META["rul_clip"], 1),
-                   alert=level, recommendation=msg)
+@app.get("/demo/sample")
+def demo_sample():
+    """Window of a held-out training engine cut at `wear` percent of its life,
+    with the true RUL, so the dashboard can compare prediction with reality."""
+    try:
+        unit = int(request.args.get("unit", DEMO_UNITS[0] if DEMO_UNITS else 1))
+        wear = float(request.args.get("wear", 60))
+    except ValueError:
+        return jsonify(error="unit and wear must be numbers"), 400
+    if unit not in DEMO_UNITS:
+        return jsonify(error=f"unit must be one of {DEMO_UNITS}"), 400
+    eng = _demo_data()
+    eng = eng[eng["unit"] == unit].sort_values("cycle")
+    life = len(eng)
+    min_c = META.get("min_cycles", 1)
+    cut = int(round(min(max(wear, 0), 100) / 100 * life))
+    cut = min(max(cut, min_c), life)
+    window = eng.iloc[max(0, cut - DEMO_WINDOW):cut]
+    true_rul = min(life - cut, META["rul_clip"])
+    return jsonify(unit=unit, life_cycles=life, current_cycle=cut,
+                   true_rul_cycles=true_rul,
+                   cycles=window[dp.SENSOR_COLS].to_dict("records"),
+                   spark={s: window[s].round(3).tolist() for s, _, _ in SPARK_SENSORS})
 
 
 DASHBOARD = r"""<!doctype html>
@@ -267,7 +290,7 @@ DASHBOARD = r"""<!doctype html>
         <div class="mono" style="font-size:11px;color:var(--muted);letter-spacing:1px">EDGE INFERENCE // TURBOFAN PROGNOSTICS</div>
       </div>
     </div>
-    <div class="status-pill"><span class="dot-live"></span>SERVICE ONLINE · :8000</div>
+    <div class="status-pill"><span class="dot-live"></span>SERVICE ONLINE</div>
   </header>
   <p class="tagline">Predicting asset degradation before unplanned downtime occurs — remaining useful life estimated live from sensor telemetry.</p>
 
@@ -277,7 +300,7 @@ DASHBOARD = r"""<!doctype html>
       <p class="label">Asset Nodes</p>
       <div id="rail"></div>
       <div class="ctl" style="padding:14px 0 0">
-        <label>Wear level <b id="wearv">60%</b></label>
+        <label>Point in engine life <b id="wearv">60%</b></label>
         <input type="range" id="wear" min="0" max="100" value="60">
         <button onclick="run()">Run Inference</button>
       </div>
@@ -296,10 +319,11 @@ DASHBOARD = r"""<!doctype html>
           <p class="label" style="margin-bottom:4px">Remaining Useful Life</p>
           <div class="rul-num" id="rul">—</div>
           <div class="rul-unit">operating cycles remaining</div>
+          <div class="rul-unit" id="truth" style="margin-top:6px"></div>
           <div class="badge" id="badge"><span class="bd"></span><span id="badget">STANDBY</span></div>
         </div>
       </div>
-      <div class="rec" id="rec">Select an asset node and run inference to estimate remaining useful life from its recent sensor window.</div>
+      <div class="rec" id="rec">Select an engine and a point in its life; the service scores its last 30 cycles of real sensor data.</div>
       <div class="matrix" id="matrix"></div>
     </div>
   </div>
@@ -311,7 +335,7 @@ DASHBOARD = r"""<!doctype html>
       <div class="glass stage">
         <div class="n">01 — INGEST</div>
         <h3>Sensor Telemetry</h3>
-        <p>Twenty-one raw sensor channels plus operating settings stream in per operating cycle. Rolling windows expose degradation trend rather than instantaneous noise.</p>
+        <p>Fourteen informative sensor channels (of 21) stream in per operating cycle. Rolling windows expose degradation trend rather than instantaneous noise.</p>
       </div>
       <div class="glass stage">
         <div class="n">02 — MODEL</div>
@@ -321,87 +345,82 @@ DASHBOARD = r"""<!doctype html>
       <div class="glass stage">
         <div class="n">03 — SERVE</div>
         <h3>Dockerized Edge Node</h3>
-        <p>The ~200&nbsp;KB model runs inference locally on a gateway box beside the asset, returning RUL and a maintenance alert without a cloud round-trip.</p>
+        <p>The ~1.5&nbsp;MB model runs inference locally on a gateway box beside the asset, returning RUL and a maintenance alert without a cloud round-trip.</p>
       </div>
     </div>
 
-    <div class="sec-label" style="margin-top:36px">// Why Asymmetric Scoring</div>
-    <h2 class="sec-title">Cost of Being Wrong</h2>
+    <div class="sec-label" style="margin-top:36px">// Measured on the official test split</div>
+    <h2 class="sec-title">Model Accuracy</h2>
     <div class="metrics">
-      <div class="glass metric"><div class="big">13×</div><div class="cap">Late-prediction penalty vs early</div></div>
-      <div class="glass metric"><div class="big" id="m-rmse">—</div><div class="cap">Validation RMSE (cycles)</div></div>
-      <div class="glass metric"><div class="big">0</div><div class="cap">Unplanned outages when flagged early</div></div>
+      <div class="glass metric"><div class="big" id="m-rmse">—</div><div class="cap">Test RMSE, 100 FD001 engines (cycles)</div></div>
+      <div class="glass metric"><div class="big" id="m-nasa">—</div><div class="cap">Test NASA score (lower is better)</div></div>
+      <div class="glass metric"><div class="big" id="m-val">—</div><div class="cap">Validation RMSE, held-out engines</div></div>
     </div>
   </section>
 
-  <footer>MODEL rul_xgb · asymmetric NASA scoring · <a href="/health">/health</a> · <a href="/predict">/predict</a> — synthetic telemetry demo; swap in real C-MAPSS FD001 for production readings</footer>
+  <footer>MODEL rul_xgb · asymmetric NASA scoring · <a href="/health">/health</a> · <span>POST /predict</span> — demo replays held-out NASA C-MAPSS FD001 engines the model never trained on</footer>
 </div>
 
 <script>
 const RUL_CLIP = {{ rul_clip }};
-const SENSORS = [["Core Temp","K"],["Fan Speed","rpm"],["Pressure","psi"],["Fuel Flow","pps"]];
-let selected = 1;
+const DEMO_UNITS = {{ demo_units|tojson }};
+const SENSORS = {{ spark|tojson }};
+let selected = DEMO_UNITS[0];
 const $ = id => document.getElementById(id);
 
-// build asset rail
+// build asset rail from held-out FD001 engines
 const rail = $('rail');
-for(let i=1;i<=6;i++){
+DEMO_UNITS.forEach((u, i) => {
   const el = document.createElement('div');
-  el.className = 'asset' + (i===1?' sel':'');
-  el.innerHTML = `<span class="id">TURBOFAN_${String(i).padStart(3,'0')}</span><span class="mini"></span>`;
-  el.onclick = ()=>{ selected=i; document.querySelectorAll('.asset').forEach(a=>a.classList.remove('sel')); el.classList.add('sel'); run(); };
+  el.className = 'asset' + (i===0?' sel':'');
+  el.innerHTML = `<span class="id">FD001_ENGINE_${String(u).padStart(3,'0')}</span><span class="mini"></span>`;
+  el.onclick = ()=>{ selected=u; document.querySelectorAll('.asset').forEach(a=>a.classList.remove('sel')); el.classList.add('sel'); run(); };
   rail.appendChild(el);
-}
+});
 $('wear').oninput = e => $('wearv').textContent = e.target.value + '%';
 
-function sparkline(seed, drift){
-  let pts=[], v=50;
-  for(let i=0;i<24;i++){ v += (Math.sin(i*0.7+seed)*4) + (Math.random()-.5)*5 + drift; pts.push(v); }
-  const min=Math.min(...pts), max=Math.max(...pts), rng=(max-min)||1;
-  const d = pts.map((p,i)=>`${(i/23*100).toFixed(1)},${(30-(p-min)/rng*26-2).toFixed(1)}`).join(' ');
+function sparkline(pts){
+  if(!pts || pts.length < 2) return '';
+  const min=Math.min(...pts), max=Math.max(...pts), rng=(max-min)||1, n=pts.length-1;
+  const d = pts.map((p,i)=>`${(i/n*100).toFixed(1)},${(30-(p-min)/rng*26-2).toFixed(1)}`).join(' ');
   return `<svg viewBox="0 0 100 34" preserveAspectRatio="none"><polyline points="${d}" fill="none" stroke="var(--accent,#00d4d4)" stroke-width="1.6" vector-effect="non-scaling-stroke"/></svg>`;
 }
-function renderMatrix(wear){
-  $('matrix').innerHTML = SENSORS.map((s,i)=>{
-    const val = (400 + i*180 + wear*2 + Math.random()*8).toFixed(1);
-    return `<div class="spark"><div class="sn">${s[0]}</div><div class="sv">${val} <span style="font-size:11px;color:var(--muted)">${s[1]}</span></div>${sparkline(i*2+selected, wear/40)}</div>`;
+function renderMatrix(spark){
+  $('matrix').innerHTML = SENSORS.map(([key, name, unit])=>{
+    const series = spark[key] || [];
+    const val = series.length ? series[series.length-1].toFixed(2) : '—';
+    return `<div class="spark"><div class="sn">${name}</div><div class="sv">${val} <span style="font-size:11px;color:var(--muted)">${unit}</span></div>${sparkline(series)}</div>`;
   }).join('');
-}
-renderMatrix(60);
-
-function buildCycles(wear){
-  const w = wear/100, cy=[];
-  for(let i=0;i<20;i++){
-    const c={};
-    for(let s=1;s<=21;s++){ c["sensor_"+s] = 480 + s*6 + w*40*(s%3) + i*w*1.5 + (Math.random()-.5); }
-    c.op_setting_1=0; c.op_setting_2=0; c.op_setting_3=100; cy.push(c);
-  }
-  return cy;
 }
 
 async function run(){
   const wear = +$('wear').value;
-  renderMatrix(wear);
-  const body = { unit_id: selected, cycles: buildCycles(wear) };
   try{
-    const r = await fetch('/predict',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    const s = await (await fetch(`/demo/sample?unit=${selected}&wear=${wear}`)).json();
+    if(s.error) throw new Error(s.error);
+    renderMatrix(s.spark);
+    const r = await fetch('/predict',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({unit_id: selected, cycles: s.cycles})});
     const d = await r.json();
+    if(!r.ok) throw new Error(d.error || r.status);
     const con = $('console'); con.className = 'glass console ' + d.alert;
-    const hi = d.health_index != null ? d.health_index : Math.round(100*d.predicted_rul_cycles/RUL_CLIP);
+    const hi = d.health_index;
     $('rul').textContent = d.predicted_rul_cycles;
+    $('truth').textContent = `actual: ${s.true_rul_cycles} cycles · cycle ${s.current_cycle} of ${s.life_cycles}`;
     $('hpct').textContent = hi + '%';
     $('fill').style.height = Math.max(3,Math.min(100,hi)) + '%';
     $('badget').textContent = d.alert;
     $('rec').textContent = d.recommendation;
-    const badge = $('badge');
-    badge.classList.toggle('glitch', d.alert === 'CRITICAL');
+    $('badge').classList.toggle('glitch', d.alert === 'CRITICAL');
     if (window.setCoreState) window.setCoreState(d.alert, hi);
-  }catch(e){ $('rec').textContent = 'Cannot reach inference service — is the server running on :8000? ('+e+')'; }
+  }catch(e){ $('rec').textContent = 'Inference failed: ' + e.message; }
 }
 
-// fill the validation-RMSE metric from /health
+// fill the metrics from /health
 fetch('/health').then(r=>r.json()).then(d=>{
-  if(d.val_rmse!=null) $('m-rmse').textContent = d.val_rmse.toFixed(1);
+  if(d.test_rmse!=null) $('m-rmse').textContent = d.test_rmse.toFixed(1);
+  if(d.test_nasa_score!=null) $('m-nasa').textContent = Math.round(d.test_nasa_score);
+  if(d.val_rmse!=null) $('m-val').textContent = d.val_rmse.toFixed(1);
 }).catch(()=>{});
 
 run();
