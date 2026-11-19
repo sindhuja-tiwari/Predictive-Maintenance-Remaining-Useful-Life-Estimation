@@ -1,5 +1,7 @@
 # Predictive Maintenance: Remaining Useful Life (RUL) Estimation for Turbofan Engines
 
+![ci](https://github.com/sindhuja-tiwari/Predictive-Maintenance-Remaining-Useful-Life-Estimation/actions/workflows/ci.yml/badge.svg)
+
 Estimates the **Remaining Useful Life** of turbofan engines from time-series sensor data, moving
 maintenance from *reactive* (fix after failure) and *scheduled* (fix on a fixed calendar, wasting
 healthy component life) to **condition-based**: service each unit when its measured degradation
