@@ -19,7 +19,7 @@ pypdf>=4.0
 
 # LLM providers (only the one matching your API key is used at runtime)
 anthropic>=0.39
-openai>=1.40
+openai>=3.51.0
 
 # Optional knowledge graph
 neo4j>=5.0
