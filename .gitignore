@@ -8,3 +8,8 @@ venv/
 # built at runtime
 copilot/.chroma/
 data/synthetic/
+
+# extra C-MAPSS subsets: download from NASA, see README
+data/*_FD002.txt
+data/*_FD003.txt
+data/*_FD004.txt

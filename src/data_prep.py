@@ -19,6 +19,11 @@ OP_COLS = ["op_setting_1", "op_setting_2", "op_setting_3"]
 SENSOR_COLS = [f"sensor_{i}" for i in range(1, 22)]
 ALL_COLS = INDEX_COLS + OP_COLS + SENSOR_COLS
 
+# Operating conditions per C-MAPSS subset. FD002 and FD004 mix six flight
+# conditions, which shift every sensor far more than wear does, so their sensors
+# have to be normalised per condition before any degradation signal shows.
+N_CONDITIONS = {"FD001": 1, "FD002": 6, "FD003": 1, "FD004": 6}
+
 RUL_CLIP = 125        # piecewise-linear RUL: "as-good-as-new" until wear starts
 BASELINE_CYCLES = 20  # first N cycles of each training engine define "healthy"
 
@@ -53,6 +58,52 @@ def select_useful_sensors(train_df):
     two values. This leaves the 14 sensors used in the C-MAPSS literature."""
     return [c for c in SENSOR_COLS
             if train_df[c].nunique() > 2 and train_df[c].std() > 1e-6]
+
+
+class ConditionScaler:
+    """Per-operating-condition sensor normalisation (needed for FD002 / FD004).
+
+    Fit on training data only: cluster the three operating settings into
+    `n_conditions` groups, then store each sensor's mean and std within each
+    group. transform() assigns every row to its nearest condition and replaces
+    the sensors with z-scores inside that condition. With n_conditions=1 this is
+    plain standardisation. Everything is plain lists, so it can go in meta.json."""
+
+    def __init__(self, n_conditions, seed=42):
+        self.n_conditions = n_conditions
+        self.seed = seed
+
+    def fit(self, train_df, sensors):
+        from sklearn.cluster import KMeans   # training only; the service never needs it
+        self.sensors = list(sensors)
+        ops = train_df[OP_COLS].values
+        self.op_mean = ops.mean(axis=0)
+        self.op_std = ops.std(axis=0) + 1e-9
+        z = (ops - self.op_mean) / self.op_std
+        km = KMeans(self.n_conditions, n_init=10, random_state=self.seed).fit(z)
+        self.centers = km.cluster_centers_
+        cond = km.labels_
+        vals = train_df[self.sensors].values
+        self.mean = np.stack([vals[cond == k].mean(axis=0) for k in range(self.n_conditions)])
+        self.std = np.stack([vals[cond == k].std(axis=0) for k in range(self.n_conditions)]) + 1e-6
+        return self
+
+    def condition(self, df):
+        z = (df[OP_COLS].values - self.op_mean) / self.op_std
+        d = ((z[:, None, :] - self.centers[None, :, :]) ** 2).sum(axis=2)
+        return d.argmin(axis=1)
+
+    def transform(self, df):
+        cond = self.condition(df)
+        out = df.copy()
+        out[self.sensors] = (df[self.sensors].values - self.mean[cond]) / self.std[cond]
+        return out
+
+    def to_dict(self):
+        return {"n_conditions": self.n_conditions, "sensors": self.sensors,
+                "op_mean": self.op_mean.tolist(), "op_std": self.op_std.tolist(),
+                "centers": self.centers.tolist(), "mean": self.mean.tolist(),
+                "std": self.std.tolist()}
 
 
 def healthy_baseline(train_df, sensor_cols, n_cycles=BASELINE_CYCLES):

@@ -10,6 +10,7 @@ Endpoints:
   GET  /health        liveness + model metadata and test metrics
   POST /predict       score one engine's recent cycle window -> RUL + alert
   GET  /demo/sample   a window from a held-out FD001 engine, for the dashboard
+  GET  /demo/history  predicted vs true RUL at every cycle of a held-out engine, with alert history
 
 POST /predict body:
 {
@@ -29,7 +30,7 @@ from flask import Flask, request, jsonify, render_template_string
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 import data_prep as dp  # noqa: E402
-from inference import InputError, get_predictor  # noqa: E402
+from inference import InputError, alert_for, get_predictor  # noqa: E402
 
 app = Flask(__name__)
 PREDICTOR = get_predictor()
@@ -107,6 +108,43 @@ def demo_sample():
                    true_rul_cycles=true_rul,
                    cycles=window[dp.SENSOR_COLS].to_dict("records"),
                    spark={s: window[s].round(3).tolist() for s, _, _ in SPARK_SENSORS})
+
+
+@app.get("/demo/history")
+def demo_history():
+    """Predicted vs true RUL at every cycle of a held-out engine, plus the
+    alert history: when it first went to WARNING / CRITICAL and how many cycles
+    before failure that was. Only held-out engines, so the model never saw them."""
+    try:
+        unit = int(request.args.get("unit", DEMO_UNITS[0] if DEMO_UNITS else 1))
+    except ValueError:
+        return jsonify(error="unit must be a number"), 400
+    if unit not in DEMO_UNITS:
+        return jsonify(error=f"unit must be one of {DEMO_UNITS}"), 400
+    eng = _demo_data()
+    eng = eng[eng["unit"] == unit].sort_values("cycle")
+    life = len(eng)
+    clip = META["rul_clip"]
+    series = PREDICTOR.predict_series(eng[dp.SENSOR_COLS].to_dict("records"))
+
+    points, events, prev = [], [], None
+    for cycle, rul in series:
+        level, _ = alert_for(rul)
+        true_rul = min(life - cycle, clip)
+        points.append({"cycle": cycle, "predicted": round(rul, 1),
+                       "true": true_rul, "alert": level})
+        if level != prev:
+            events.append({"cycle": cycle, "alert": level,
+                           "cycles_before_failure": life - cycle})
+            prev = level
+
+    def first(levels):
+        return next((e["cycles_before_failure"] for e in events if e["alert"] in levels), None)
+
+    return jsonify(unit=unit, life_cycles=life, min_cycle=series[0][0],
+                   points=points, events=events,
+                   warning_lead_cycles=first({"WARNING", "CRITICAL"}),
+                   critical_lead_cycles=first({"CRITICAL"}))
 
 
 DASHBOARD = r"""<!doctype html>
@@ -276,6 +314,21 @@ DASHBOARD = r"""<!doctype html>
   .metric{padding:18px;text-align:center}
   .metric .big{font-family:Rajdhani;font-weight:700;font-size:34px;color:var(--teal-bright)}
   .metric .cap{font-family:'Share Tech Mono',monospace;font-size:10px;letter-spacing:1px;color:var(--muted);text-transform:uppercase;margin-top:4px}
+
+  /* degradation history panel */
+  .history{padding:18px 22px 20px;margin-top:16px}
+  .hist-head{display:flex;justify-content:space-between;align-items:flex-start;gap:16px;flex-wrap:wrap}
+  .hist-sub{color:var(--text);font-size:14px;line-height:1.5;max-width:560px}
+  .legend{display:flex;gap:16px;font-size:12px;color:var(--muted);align-items:center}
+  .legend i{display:inline-block;width:18px;height:0;border-top:2.5px solid var(--teal-bright);margin-right:6px;vertical-align:middle}
+  .legend i.truth{border-top:2px dashed #8a95a3}
+  #chart svg{width:100%;height:auto;display:block;margin-top:10px}
+  #chart text{font-family:'Share Tech Mono',monospace;font-size:10px;fill:var(--muted)}
+  .events{list-style:none;margin:14px 0 0;padding:0;display:flex;flex-wrap:wrap;gap:8px 22px;font-size:13px;color:var(--muted)}
+  .events li b{font-weight:600}
+  .events .WARNING b{color:#ff7a00}
+  .events .CRITICAL b{color:var(--red)}
+  .events .OK b{color:var(--teal-bright)}
 </style>
 </head>
 <body>
@@ -328,6 +381,18 @@ DASHBOARD = r"""<!doctype html>
     </div>
   </div>
 
+  <section class="glass history" id="history">
+    <div class="hist-head">
+      <div>
+        <p class="label" style="margin-bottom:4px">Degradation history</p>
+        <div class="hist-sub" id="histsub">Pick an engine to see its predicted remaining life at every cycle, next to the real value.</div>
+      </div>
+      <div class="legend"><span><i></i>Predicted RUL</span><span><i class="truth"></i>Actual RUL</span></div>
+    </div>
+    <div id="chart"></div>
+    <ol class="events" id="events"></ol>
+  </section>
+
   <section class="pipeline">
     <div class="sec-label">// System Architecture</div>
     <h2 class="sec-title">The Edge Inference Pipeline</h2>
@@ -379,6 +444,86 @@ DEMO_UNITS.forEach((u, i) => {
 });
 $('wear').oninput = e => $('wearv').textContent = e.target.value + '%';
 
+// ---- degradation history chart: predicted vs actual RUL per cycle ----
+const HIST = {};
+const LEVEL_COLOR = {OK:'#ffb300', WARNING:'#ff7a00', CRITICAL:'#E53935'};
+let histUnit = null, histCursor = null;
+
+function cursorCycle(h, wear){
+  const cut = Math.round(Math.min(Math.max(wear,0),100)/100*h.life_cycles);
+  return Math.min(Math.max(cut, h.min_cycle), h.life_cycles);
+}
+function firstAlerts(h){
+  const seen = new Set();
+  return h.events.filter(e=>{
+    if(e.alert==='OK' || seen.has(e.alert)) return false;
+    seen.add(e.alert); return true;
+  });
+}
+function drawHistory(h, cursor){
+  const W=720, H=250, L=38, R=14, T=12, B=28;
+  const x0=h.min_cycle, x1=h.life_cycles;
+  const X = c => L + (c-x0)/Math.max(x1-x0,1)*(W-L-R);
+  const Y = r => T + (1 - r/RUL_CLIP)*(H-T-B);
+  const line = key => h.points.map(p=>`${X(p.cycle).toFixed(1)},${Y(p[key]).toFixed(1)}`).join(' ');
+  let g = '';
+  g += `<rect x="${L}" y="${Y(50)}" width="${W-L-R}" height="${Y(20)-Y(50)}" fill="#ff7a00" opacity=".10"/>`;
+  g += `<rect x="${L}" y="${Y(20)}" width="${W-L-R}" height="${Y(0)-Y(20)}" fill="#E53935" opacity=".14"/>`;
+  [0,50,100,RUL_CLIP].forEach(v=>{
+    g += `<line x1="${L}" x2="${W-R}" y1="${Y(v)}" y2="${Y(v)}" stroke="#1e252d"/>`;
+    g += `<text x="${L-6}" y="${Y(v)+3}" text-anchor="end">${v}</text>`;
+  });
+  g += `<text x="${L+6}" y="${Y(35)+3}">warning (50 or less)</text>`;
+  g += `<text x="${L+6}" y="${Y(10)+3}">critical (20 or less)</text>`;
+  const step = x1-x0 > 250 ? 100 : 50;
+  for(let c=Math.ceil(x0/step)*step; c<=x1; c+=step){
+    g += `<text x="${X(c)}" y="${H-8}" text-anchor="middle">${c}</text>`;
+  }
+  g += `<polyline points="${line('true')}" fill="none" stroke="#8a95a3" stroke-width="1.8" stroke-dasharray="5 4"/>`;
+  g += `<polyline points="${line('predicted')}" fill="none" stroke="#ffb300" stroke-width="2.2" stroke-linejoin="round"/>`;
+  firstAlerts(h).forEach(e=>{
+    const p = h.points.find(q=>q.cycle===e.cycle);
+    g += `<circle cx="${X(e.cycle)}" cy="${Y(p.predicted)}" r="4.5" fill="${LEVEL_COLOR[e.alert]}" stroke="#0a0d10" stroke-width="1.5"/>`;
+  });
+  if(cursor!=null){
+    const p = h.points.find(q=>q.cycle===cursor) || h.points[h.points.length-1];
+    g += `<line x1="${X(p.cycle)}" x2="${X(p.cycle)}" y1="${T}" y2="${H-B}" stroke="#E4E7EB" stroke-opacity=".5" stroke-dasharray="2 3"/>`;
+    g += `<circle cx="${X(p.cycle)}" cy="${Y(p.predicted)}" r="5" fill="#E4E7EB"/>`;
+  }
+  $('chart').innerHTML = `<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="Predicted and actual remaining useful life by cycle for engine ${h.unit}">${g}</svg>`;
+}
+function describeHistory(h){
+  const w = h.warning_lead_cycles, c = h.critical_lead_cycles;
+  let t = `Engine ${h.unit} ran ${h.life_cycles} cycles before failure. `;
+  if(w==null) t += 'The model never raised a warning for this engine.';
+  else{
+    t += `The model raised a warning ${w} cycles before failure`;
+    t += c==null ? ' and never reached critical.' : ` and went critical ${c} cycles before failure.`;
+  }
+  $('histsub').textContent = t;
+  const firsts = firstAlerts(h);
+  const flips = h.events.filter(e=>e.alert!=='OK').length - firsts.length + h.events.filter(e=>e.alert==='OK' && e.cycle!==h.min_cycle).length;
+  $('events').innerHTML = firsts.map(e=>
+    `<li class="${e.alert}"><b>first ${e.alert.toLowerCase()}</b> at cycle ${e.cycle}, ${e.cycles_before_failure} cycles before failure</li>`).join('')
+    + (flips > 0 ? `<li>${flips} more alert changes near the thresholds (no smoothing applied)</li>` : '');
+}
+async function showHistory(unit, cursor){
+  try{
+    if(!HIST[unit]){
+      const r = await fetch(`/demo/history?unit=${unit}`);
+      const d = await r.json();
+      if(!r.ok) throw new Error(d.error || r.status);
+      HIST[unit] = d;
+    }
+    histUnit = unit; histCursor = cursor;
+    drawHistory(HIST[unit], cursor); describeHistory(HIST[unit]);
+  }catch(e){ $('histsub').textContent = 'Could not load history: ' + e.message; }
+}
+// move the cursor along the chart while the slider is dragged
+$('wear').addEventListener('input', e=>{
+  const h = HIST[histUnit]; if(h) drawHistory(h, cursorCycle(h, +e.target.value));
+});
+
 function sparkline(pts){
   if(!pts || pts.length < 2) return '';
   const min=Math.min(...pts), max=Math.max(...pts), rng=(max-min)||1, n=pts.length-1;
@@ -399,6 +544,7 @@ async function run(){
     const s = await (await fetch(`/demo/sample?unit=${selected}&wear=${wear}`)).json();
     if(s.error) throw new Error(s.error);
     renderMatrix(s.spark);
+    showHistory(selected, s.current_cycle);
     const r = await fetch('/predict',{method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({unit_id: selected, cycles: s.cycles})});
     const d = await r.json();
