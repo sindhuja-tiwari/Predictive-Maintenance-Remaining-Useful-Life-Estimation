@@ -29,6 +29,16 @@ WINDOWS = (5, 15)
 SEED = 42
 
 
+def make_regressor(n_estimators=2000):
+    """The XGBoost settings used for every C-MAPSS subset."""
+    return xgb.XGBRegressor(
+        n_estimators=n_estimators, max_depth=4, learning_rate=0.02,
+        subsample=0.8, colsample_bytree=0.7, min_child_weight=10,
+        reg_lambda=2.0, n_jobs=1, random_state=SEED, tree_method="hist",
+        early_stopping_rounds=100,
+    )
+
+
 def build_dataset(data_dir=None):
     train_raw = dp.load_raw("train", data_dir=data_dir)
     sensors = dp.select_useful_sensors(train_raw)
@@ -49,12 +59,7 @@ def train(data_dir=None, model_dir=MODEL_DIR, n_estimators=2000, verbose=True):
     tr_idx, va_idx = next(gss.split(df, groups=df["unit"]))
     tr, va = df.iloc[tr_idx], df.iloc[va_idx]
 
-    model = xgb.XGBRegressor(
-        n_estimators=n_estimators, max_depth=4, learning_rate=0.02,
-        subsample=0.8, colsample_bytree=0.7, min_child_weight=10,
-        reg_lambda=2.0, n_jobs=1, random_state=SEED, tree_method="hist",
-        early_stopping_rounds=100,
-    )
+    model = make_regressor(n_estimators)
     model.fit(tr[feat_cols], tr["RUL"],
               eval_set=[(va[feat_cols], va["RUL"])], verbose=False)
 

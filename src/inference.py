@@ -86,6 +86,21 @@ class RulPredictor:
             "recommendation": msg,
         }
 
+    def predict_series(self, cycles):
+        """Score every cycle of one engine's history in a single pass.
+
+        cycles: the engine's readings, oldest first (same format as predict()).
+        Returns [(cycle_number, predicted_rul), ...] starting at the first
+        cycle that has a full window. The features only look backwards, so each
+        value equals what predict() gives for the readings up to that cycle."""
+        df = self._frame(cycles)
+        m = self.meta
+        feats = dp.engineer(df, m["sensors"], tuple(m["windows"]), m["baseline"])
+        start = m.get("min_cycles", 1) - 1
+        x = feats.iloc[start:][m["feature_cols"]]
+        rul = np.clip(self.model.predict(x), 0, m["rul_clip"])
+        return [(int(c), float(r)) for c, r in zip(feats["cycle"].iloc[start:], rul)]
+
 
 _DEFAULT = None
 

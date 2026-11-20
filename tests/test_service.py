@@ -88,3 +88,35 @@ def test_dashboard_and_demo_sample(client):
     d = client.post("/predict", json={"cycles": s["cycles"]}).get_json()
     assert abs(d["predicted_rul_cycles"] - s["true_rul_cycles"]) < 40
     assert client.get("/demo/sample?unit=99999").status_code == 400
+
+
+def test_history_covers_every_cycle_and_matches_predict(client):
+    import app as service_app
+    unit = service_app.DEMO_UNITS[0]
+    h = client.get(f"/demo/history?unit={unit}").get_json()
+    assert h["points"][0]["cycle"] == h["min_cycle"] == 15
+    assert len(h["points"]) == h["life_cycles"] - 14
+    assert h["points"][-1]["true"] == 0
+
+    # a point on the curve is what /predict says for the readings up to that cycle
+    eng = dp.load_raw("train")
+    eng = eng[eng.unit == unit].sort_values("cycle")
+    cut = 60
+    d = client.post("/predict", json={
+        "cycles": eng.iloc[:cut][dp.SENSOR_COLS].to_dict("records")}).get_json()
+    point = next(p for p in h["points"] if p["cycle"] == cut)
+    assert abs(d["predicted_rul_cycles"] - point["predicted"]) <= 0.2
+
+
+def test_history_warns_before_failure(client):
+    import app as service_app
+    for unit in service_app.DEMO_UNITS:
+        h = client.get(f"/demo/history?unit={unit}").get_json()
+        assert h["warning_lead_cycles"] is not None
+        assert h["critical_lead_cycles"] is not None
+        assert h["warning_lead_cycles"] >= h["critical_lead_cycles"]
+
+
+@pytest.mark.parametrize("query", ["unit=99999", "unit=abc"])
+def test_history_bad_unit_returns_400(client, query):
+    assert client.get(f"/demo/history?{query}").status_code == 400

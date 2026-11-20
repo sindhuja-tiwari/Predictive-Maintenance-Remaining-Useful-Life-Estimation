@@ -6,3 +6,7 @@ venv
 copilot/.chroma
 data/synthetic
 tests
+data/*_FD002.txt
+data/*_FD003.txt
+data/*_FD004.txt
+reports
